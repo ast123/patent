@@ -1,0 +1,277 @@
+---
+jupyter:
+  jupytext:
+    formats: ipynb,Rmd
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.1'
+      jupytext_version: 1.1.1
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+```{python}
+import pandas as pd
+```
+
+```{python}
+n_cdf = pd.read_csv('nouns+concept/patents_nouns.csv')
+```
+
+```{python}
+n_cdf.columns = ['fn', 'category', 'concepts', 'nouns']
+```
+
+```{python}
+n_cdf.head()
+```
+
+```{python}
+tr_id = pd.read_csv('../pat/train_id_lab.csv', header=None)
+dev_id = pd.read_csv('../pat/dev_id_lab.csv', header=None)
+```
+
+```{python}
+t_ids = tr_id[0].values
+d_ids = dev_id[0].values
+```
+
+```{python}
+len(t_ids), len(d_ids)
+```
+
+```{python}
+tr_n = n_cdf.loc[n_cdf['fn'].isin(t_ids)]
+dev_n = n_cdf.loc[n_cdf['fn'].isin(d_ids)]
+```
+
+```{python}
+len(tr_n), len(dev_n)
+```
+
+```{python}
+tr_n.head()
+```
+
+```{python}
+tr_n.to_csv('tr_pat_ns_concs.csv', index=False)
+```
+
+```{python}
+# !head -n 2 dev_pat_ns_concs.csv
+```
+
+```{python}
+import string
+def tokenizer(s):
+#     table = str.maketrans({k: None for k in string.punctuation})
+    s = s.replace('#', ' ')
+    return [w for w in s.split()]
+```
+
+```{python}
+import torchtext
+from torchtext import data
+
+txt_field = data.Field(sequential=True, tokenize=tokenizer, include_lengths=True, use_vocab=True)
+label_field = data.Field(sequential=False, use_vocab=True, pad_token=None, unk_token=None)
+
+tr_dev_fields = [('fn', None), ('category', label_field), ('nouns', txt_field)]
+train, val = data.TabularDataset.splits(path='./', format='csv', train='tr_pat_nouns.csv', validation='dev_pat_nouns.csv', fields=tr_dev_fields, skip_header=True)
+```
+
+```{python}
+from torchtext import vocab
+vec = vocab.Vectors('patent-100.vec','../pat')
+```
+
+```{python}
+txt_field.build_vocab(train, val, max_size=100000, vectors=vec)
+label_field.build_vocab(train)
+```
+
+```{python}
+txt_field.vocab.vectors.shape, txt_field.vocab.vectors[txt_field.vocab.stoi['abstract']]
+```
+
+```{python}
+label_field.vocab.stoi
+```
+
+```{python}
+traindl, valdl = data.BucketIterator.splits(datasets=(train, val), batch_sizes=(5,3), sort_key=lambda x: len(x.content), device=None, sort_within_batch=True, repeat=False)
+```
+
+```{python}
+batch = next(iter(traindl))
+```
+
+```{python}
+x, l = batch.content
+```
+
+```{python}
+l
+```
+
+```{python}
+class BatchGenerator:
+    def __init__(self,dl, x_field, y_field):
+        self.dl, self.x_field, self.y_field = dl, x_field, y_field
+    def __len__(self):
+        return len(self.dl)
+    def __iter__(self):
+        for b in self.dl:
+            x = getattr(b, self.x_field)
+            y = getattr(b, self.y_field)
+            yield(x,y)
+```
+
+```{python}
+train_batch_it = BatchGenerator(traindl, 'content', 'label')
+```
+
+```{python}
+(x, l),y = next(iter(train_batch_it))
+```
+
+```{python}
+l.size(0)
+```
+
+```{python}
+import torch
+device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+```
+
+```{python}
+vocab_sz = len(txt_field.vocab)
+emb_dim = 100
+n_hidden = 64
+n_out = len(label_field.vocab)
+```
+
+```{python}
+import torch
+import torch.nn as nn
+SEED = 6789#12345
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+class ConcatPoolingGRU(nn.Module):
+    def __init__(self, vocab_sz, emb_dim, n_hidden, n_out, pre_vec, bidirectional=True):
+        super().__init__()
+        self.vocab_sz = vocab_sz
+        self.emb_dim = emb_dim
+        self.n_hidden = n_hidden
+        self.n_out = n_out
+        self.bidirectional = bidirectional
+        self.emb = nn.Embedding(self.vocab_sz, self.emb_dim)
+        self.emb.weight.data.copy_(pre_vec)
+        self.emb.weight.requires_grad = False
+        self.gru = nn.GRU(self.emb_dim,self.n_hidden, bidirectional=bidirectional)
+        if bidirectional:
+            self.out = nn.Linear(self.n_hidden*2*2, self.n_out)
+        else:
+            self.out = nn.Linear(self.n_hidden*2, self.n_out)
+            
+    def forward(self, seq):
+#         bs = seq.size(1)
+        x_seq, l_seq = seq
+        bs = x_seq.size(1)
+        self.h = self.init_hidden(bs)
+        x_seq = x_seq.transpose(0,1)
+        embs = self.emb(x_seq)
+        embs = embs.transpose(0,1)
+        embs = nn.utils.rnn.pack_padded_sequence(embs, l_seq)
+        gru_out, self.h = self.gru(embs, self.h)
+        gru_out, length = nn.utils.rnn.pad_packed_sequence(gru_out)
+        
+        avg_pool = nn.functional.adaptive_avg_pool1d(gru_out.permute(1,2,0),1).view(bs,-1)
+        max_pool = nn.functional.adaptive_avg_pool1d(gru_out.permute(1,2,0),1).view(bs,-1)
+        outp = self.out(torch.cat([avg_pool, max_pool],dim=1))
+        return nn.functional.log_softmax(outp, dim=-1)
+        
+    def init_hidden(self, batch_sz):
+        if self.bidirectional:
+            return torch.zeros(2, batch_sz, self.n_hidden).to(device)
+        else:
+            return torch.zeros(1,batch_sz, self.n_hidden).to(device)
+    
+```
+
+```{python}
+traindl, valdl = data.BucketIterator.splits(datasets=(train, val), batch_sizes=(8,16), sort_key=lambda x:len(x.nouns), device=device, sort_within_batch=True,repeat=False)
+train_batch_it = BatchGenerator(traindl,'nouns','category')
+val_batch_it = BatchGenerator(valdl, 'nouns', 'category')
+m = ConcatPoolingGRU(vocab_sz,emb_dim, n_hidden, n_out, train.fields['nouns'].vocab.vectors, bidirectional=False).to(device)
+opt = torch.optim.Adam(filter(lambda p: p.requires_grad, m.parameters()), 1e-2)
+criterion = nn.NLLLoss()
+# fit model with ignite
+```
+
+```{python}
+from ignite.engine import Engine, Events, create_supervised_trainer, create_supervised_evaluator
+from ignite.metrics import Accuracy, Loss, RunningAverage, Precision, Recall, MetricsLambda
+from ignite.handlers import ModelCheckpoint,  EarlyStopping
+from ignite.contrib.handlers import ProgressBar
+# def process_function(engine, batch):
+#     m.train()
+#     optimizer.zero_grad()
+#     x, y = batch.content, batch.label
+#     y_pred = m(x)
+#     loss = criterion(y_pred, y)
+#     loss.backward()
+#     opt.step()
+#     return loss.item()
+
+# def eval_function(engine, batch):
+#     m.eval()
+#     with torch.no_grad():
+#         x, y = batch.content, batch.label
+#         y_pred = m(x)
+#         return y_pred, y
+    
+# trainer = Engine(process_function)
+precision = Precision(average=False)
+recall = Recall(average=False)
+F1 = precision*recall*2/(precision+recall+1e-20)
+F1 = MetricsLambda(lambda t: torch.mean(t).item(), F1)
+trainer = create_supervised_trainer(m, opt, criterion)
+# train_evaluator = Engine(eval_function)
+evaluator = create_supervised_evaluator(m, metrics={'accuracy':Accuracy(),'nll': Loss(criterion), 'f1':F1})
+# validation_evaluator = Engine(eval_function)
+
+# RunningAverage(output_transform=lambda x: x).attach(trainer, 'loss')
+
+# @trainer.on(Events.ITERATION_COMPLETED)
+# def log_training_loss(trainer):
+#     print("Epoch[{}] Loss: {:.2f}".format(trainer.state.epoch, trainer.state.output))
+
+@trainer.on(Events.EPOCH_COMPLETED)
+def log_training_results(trainer):
+    evaluator.run(train_batch_it)
+    metrics = evaluator.state.metrics
+    print("Training Results - Epoch: {}  Avg accuracy: {:.2f} Avg loss: {:.2f} f1: {:.2f}"
+          .format(trainer.state.epoch, metrics['accuracy'], metrics['nll'], metrics['f1']))
+
+@trainer.on(Events.EPOCH_COMPLETED)
+def log_validation_results(trainer):
+    evaluator.run(val_batch_it)
+    metrics = evaluator.state.metrics
+    print("Validation Results - Epoch: {}  Avg accuracy: {:.2f} Avg loss: {:.2f} f1: {:.2f}"
+          .format(trainer.state.epoch, metrics['accuracy'], metrics['nll'], metrics['f1']))
+
+trainer.run(train_batch_it, max_epochs=5)
+
+```
+
+```{python}
+train_batch_it
+```
+
+```{python}
+
+```
